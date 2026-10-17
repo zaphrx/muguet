@@ -1,0 +1,32 @@
+name: Build Muguet
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install cmake
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build Muguet.app
+        run: sh ./make-app.sh
+
+      - name: Package
+        run: |
+          cd build
+          zip -qry Muguet.app.zip Muguet.app
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Muguet-macOS
+          path: build/Muguet.app.zip
