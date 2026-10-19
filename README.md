@@ -14,7 +14,7 @@ Because I care about me not getting sued, you will need your own copy as a `.zip
 
 It's basically the same source as the web port.
 
-Muguet itself will then asks for that zip
+Muguet itself will then ask for that zip
 
 ## Requirements
 - Apple Silicon Mac, macOS 14 or later
@@ -67,5 +67,7 @@ One player hosts from the launcher (or runs `muguet-server` on any machine), the
 - [Dbhardwaj99](https://github.com/Dbhardwaj99) for reporting real free disk space
 - [dre4moff](https://github.com/dre4moff) for releasing controller input when the app loses focus
 - [kjnefk](https://github.com/kjnefk) for importing your own saves
+- [diamondraras](https://github.com/diamondraras) for controller look sensitivity
+- [lunar-me](https://github.com/lunar-me) for fixing a typo in the readme
 
 Contributions are welcome !

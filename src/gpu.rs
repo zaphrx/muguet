@@ -96,6 +96,7 @@ struct Fmt {
 static BC_SOFT: AtomicBool = AtomicBool::new(false);
 static BC1_ASTC: AtomicBool = AtomicBool::new(false);
 static F32_HALF: AtomicBool = AtomicBool::new(false);
+static CLOUD_SHADOWS: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_CLOUD_SHADOWS").map_or(true, |v| v != "0"));
 static MEM_STATS: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_MEM_STATS").is_ok_and(|v| v != "0"));
 static RE_VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@binding\((\d+)u?\)\s*var(?:<[^>]*>)?\s+(\w+)").unwrap());
 static RE_IDENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w+").unwrap());
@@ -344,6 +345,17 @@ fn vertex_format(dxgi: u32) -> Option<VertexFormat> {
     })
 }
 fn wf(w: u32) -> f32 { f32::from_bits(w) }
+fn srv_view_key(dim: TextureViewDimension, proxied: bool) -> &'static str {
+    use TextureViewDimension as D;
+    match (dim, proxied) {
+        (D::D1, false) => "D1", (D::D1, true) => "D1:p",
+        (D::D2, false) => "D2", (D::D2, true) => "D2:p",
+        (D::D2Array, false) => "D2Array", (D::D2Array, true) => "D2Array:p",
+        (D::Cube, false) => "Cube", (D::Cube, true) => "Cube:p",
+        (D::CubeArray, false) => "CubeArray", (D::CubeArray, true) => "CubeArray:p",
+        (D::D3, false) => "D3", (D::D3, true) => "D3:p",
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind { Uniform, Storage, ReadOnlyStorage, Sampler, SamplerCmp, Texture, StorageTexture }
@@ -607,6 +619,8 @@ struct Program {
     variants: RefCell<HashMap<String, Option<ShaderModule>>>,
     label: String,
     uid: u64,
+    stable: u64,
+    hash: String,
     vid: bool,
     iid: bool,
     out_locs: Vec<u32>,
@@ -615,8 +629,18 @@ struct Program {
 }
 #[derive(Clone, Copy)]
 struct El { sem: u32, idx: u32, fmt: u32, slot: u32, offset: u32, cls: u32 }
-struct LayoutObj { els: Vec<El>, slots: Vec<(u32, u32)> }
-struct StateObj { words: Vec<u32>, sampler: Option<Sampler> }
+struct LayoutObj { els: Vec<El>, slots: Vec<(u32, u32)>, stable: u64 }
+struct StateObj { words: Vec<u32>, sampler: Option<Sampler>, stable: u64 }
+
+fn stable_hash<T: std::hash::Hash>(t: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    t.hash(&mut h);
+    h.finish()
+}
+fn layout_stable(els: &[El], slots: &[(u32, u32)]) -> u64 {
+    stable_hash(&(els.iter().map(|e| [e.sem, e.idx, e.fmt, e.slot, e.offset, e.cls]).collect::<Vec<_>>(), slots))
+}
 struct ViewObj {
     res: u32,
     is_buf: bool,
@@ -726,6 +750,26 @@ struct PipeJob {
 }
 enum PipeEntry { Pending, Done(Option<Rc<Pl>>) }
 
+struct PipeStates { sig: Vec<SigEl>, rs: Option<Rc<StateObj>>, blend: Option<Rc<StateObj>>, dss: Option<Rc<StateObj>> }
+
+const RECIPE_LIMIT: u64 = 32 << 20;
+static PIPE_CACHE: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_PIPE_CACHE").map_or(true, |v| v != "0"));
+
+fn parse_format(name: &str) -> Option<TextureFormat> {
+    use TextureFormat as F;
+    const ALL: &[TextureFormat] = &[
+        F::R8Unorm, F::R8Snorm, F::R8Uint, F::R8Sint, F::R16Uint, F::R16Sint, F::R16Unorm, F::R16Snorm, F::R16Float,
+        F::Rg8Unorm, F::Rg8Snorm, F::Rg8Uint, F::Rg8Sint, F::R32Uint, F::R32Sint, F::R32Float,
+        F::Rg16Uint, F::Rg16Sint, F::Rg16Unorm, F::Rg16Snorm, F::Rg16Float,
+        F::Rgba8Unorm, F::Rgba8UnormSrgb, F::Rgba8Snorm, F::Rgba8Uint, F::Rgba8Sint, F::Bgra8Unorm, F::Bgra8UnormSrgb,
+        F::Rgb9e5Ufloat, F::Rgb10a2Uint, F::Rgb10a2Unorm, F::Rg11b10Ufloat,
+        F::Rg32Uint, F::Rg32Sint, F::Rg32Float, F::Rgba16Uint, F::Rgba16Sint, F::Rgba16Unorm, F::Rgba16Snorm, F::Rgba16Float,
+        F::Rgba32Uint, F::Rgba32Sint, F::Rgba32Float,
+        F::Stencil8, F::Depth16Unorm, F::Depth24Plus, F::Depth24PlusStencil8, F::Depth32Float, F::Depth32FloatStencil8,
+    ];
+    ALL.iter().copied().find(|f| format!("{f:?}") == name)
+}
+
 fn compile_pipeline(device: &Device, job: &PipeJob) -> Option<RenderPipeline> {
     let vbs: Vec<Option<VertexBufferLayout>> = job.vbs.iter().map(|v| v.as_ref().map(|(stride, step, attrs)| VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes: attrs })).collect();
     let desc = RenderPipelineDescriptor {
@@ -799,6 +843,11 @@ pub struct Gpu {
     shader_index: HashMap<String, serde_json::Value>,
     shader_dir: PathBuf,
     map_programs: HashMap<String, Rc<Program>>,
+    warm: std::collections::VecDeque<serde_json::Value>,
+    warm_programs: HashMap<String, Option<Rc<Program>>>,
+    warmed: u64,
+    warm_t0: Option<Instant>,
+    recipe_bytes: u64,
     next_uid: u64,
     bgl_cache: FxHashMap<(u64, u128, u32, u32), (BindGroupLayout, u64)>,
     empty_bgl: Option<(BindGroupLayout, u64)>,
@@ -826,6 +875,9 @@ pub struct Gpu {
     proxy_pipelines: HashMap<&'static str, RenderPipeline>,
     unfilt: HashMap<u64, (u128, u128)>,
     nearest: HashMap<u32, Sampler>,
+    ramp_tex: u32,
+    ramp_view: Option<(u32, TextureView)>,
+    white_view: Option<TextureView>,
     f2d_pipeline: Option<RenderPipeline>,
     bc1_astc: Option<ComputePipeline>,
     astc_jobs: Vec<AstcJob>,
@@ -977,11 +1029,11 @@ impl Gpu {
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0, pipe_wait_left: PIPELINE_WAIT,
             base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
-            map_programs: HashMap::new(), s: State::new(), pdirty: true, last_pl: None, shader_index, shader_dir, next_uid: 1,
+            map_programs: HashMap::new(), warm: Default::default(), warm_programs: HashMap::new(), warmed: 0, warm_t0: None, recipe_bytes: 0, s: State::new(), pdirty: true, last_pl: None, shader_index, shader_dir, next_uid: 1,
             bgl_cache: FxHashMap::default(), empty_bgl: None, pipelines: FxHashMap::default(), compute: HashMap::new(), bind_groups: FxHashMap::default(),
             ubo_slots: (0..FRAME_SLOTS).map(|_| Vec::new()).collect(), ubo_shared: Vec::new(), ubo_slot: 0, ubo_chunk: 0, ubo_off: 0,
             dummy_tex: HashMap::new(), dummy_smp: None, dummy_cmp: None, dummy_bufs: HashMap::new(), zero_vb: None, zero_src: None, scratch: None,
-            proxy_pipelines: HashMap::new(), unfilt: HashMap::new(), nearest: HashMap::new(), f2d_pipeline: None, bc1_astc: None, astc_jobs: Vec::new(), astc_src: Vec::new(), astc_dst_bytes: 0, astc_blocks: 0, astc_pending: Default::default(), astc_in_encoder: 0, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
+            proxy_pipelines: HashMap::new(), unfilt: HashMap::new(), nearest: HashMap::new(), ramp_tex: 0, ramp_view: None, white_view: None, f2d_pipeline: None, bc1_astc: None, astc_jobs: Vec::new(), astc_src: Vec::new(), astc_dst_bytes: 0, astc_blocks: 0, astc_pending: Default::default(), astc_in_encoder: 0, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
             occlusion_set: None, occlusion_next: 0, occlusion_active: None, occlusion_pass_slot: None,
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(), counter_src: None, counter_slot: 0,
             frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16],
@@ -1113,6 +1165,7 @@ impl Gpu {
     }
 
     fn run(&mut self) -> ! {
+        self.load_recipes();
         let mut tail = RING_DATA as i32;
         self.hdr(1).store(tail, Ordering::SeqCst);
         self.hdr(2).store(1, Ordering::SeqCst);
@@ -1137,7 +1190,11 @@ impl Gpu {
                     self.hdr(5).store(0, Ordering::SeqCst);
                     continue;
                 }
-                let timeout = if self.pending_maps.is_empty() && self.inflight.load(Ordering::SeqCst) == 0 { 100 } else { 1 };
+                if !self.warm.is_empty() {
+                    self.warm_step(Duration::from_millis(3));
+                    while let Ok((done, pipeline)) = self.pipe_results.try_recv() { self.finish_pipeline(done, pipeline); }
+                }
+                let timeout = if self.pending_maps.is_empty() && self.inflight.load(Ordering::SeqCst) == 0 && self.warm.is_empty() { 100 } else { 1 };
                 let _ = self.mem.atomic_wait32(self.ring, tail as u32, Some(Duration::from_millis(timeout)));
                 self.hdr(5).store(0, Ordering::SeqCst);
                 continue;
@@ -1304,6 +1361,7 @@ impl Gpu {
     }
 
     fn destroy(&mut self, id: u32) {
+        if id == self.ramp_tex { self.ramp_tex = 0; self.ramp_view = None; }
         if self.astc_pending.contains(&id) { self.flush_astc(); }
         self.pending_clears.remove(&id);
         if self.is_bound(id) { self.pdirty = true; }
@@ -1584,7 +1642,8 @@ impl Gpu {
                 slots.push((e.slot, e.cls));
             }
         }
-        self.set_obj(id, Obj::Layout(Rc::new(LayoutObj { els, slots })));
+        let stable = layout_stable(&els, &slots);
+        self.set_obj(id, Obj::Layout(Rc::new(LayoutObj { els, slots, stable })));
     }
 
     fn create_state(&mut self, p: u64, n: u64) {
@@ -1592,7 +1651,8 @@ impl Gpu {
         let kind = self.u(p + 1);
         let words: Vec<u32> = (2..n).map(|i| self.u(p + i)).collect();
         let sampler = if kind == 3 { Some(self.make_sampler(&words)) } else { None };
-        self.set_obj(id, Obj::State(Rc::new(StateObj { words, sampler })));
+        let stable = stable_hash(&words);
+        self.set_obj(id, Obj::State(Rc::new(StateObj { words, sampler, stable })));
     }
 
     fn make_sampler(&self, w: &[u32]) -> Sampler {
@@ -1638,7 +1698,7 @@ impl Gpu {
             }
             _ => return None,
         };
-        let prog = self.load_program(&hash, stage);
+        let prog = self.warm_program(&hash, stage);
         if let Some(Obj::Shader(s)) = self.obj_mut(id) { s.program = Some(prog.clone()); }
         prog
     }
@@ -1694,7 +1754,8 @@ impl Gpu {
         let out_locs = if stage == 0 { locations_in(&text, true) } else { vec![] };
         let in_locs = if stage == 1 { locations_in(&text, false) } else { vec![] };
         let clip = text.contains("@builtin(clip_distances)");
-        Some(Rc::new(Program { module, info, consts, pack, text, flat, group_bindings, variants: RefCell::new(HashMap::new()), label, uid, vid, iid, out_locs, in_locs, clip }))
+        let stable = stable_hash(&(hash, stage, pause));
+        Some(Rc::new(Program { module, info, consts, pack, text, flat, group_bindings, variants: RefCell::new(HashMap::new()), label, uid, stable, hash: if pause { String::new() } else { hash.to_string() }, vid, iid, out_locs, in_locs, clip }))
     }
 
     fn variant(&self, prog: &Program, key: &str, make: impl FnOnce(&str) -> String) -> Option<ShaderModule> {
@@ -1834,9 +1895,12 @@ impl Gpu {
         }
     }
     fn mark_depth_dirty(&mut self, id: u32) {
+        self.mark_ds_dirty(id, true, true);
+    }
+    fn mark_ds_dirty(&mut self, id: u32, depth: bool, stencil: bool) {
         if let Some(t) = self.tex_mut(id) {
-            if let Some(p) = t.proxy_depth.as_mut() { p.dirty = true; }
-            if let Some(p) = t.proxy_stencil.as_mut() { p.dirty = true; }
+            if depth { if let Some(p) = t.proxy_depth.as_mut() { p.dirty = true; } }
+            if stencil { if let Some(p) = t.proxy_stencil.as_mut() { p.dirty = true; } }
         }
     }
 
@@ -1875,7 +1939,7 @@ impl Gpu {
         let (ro_d, ro_s) = (ds.flags & 1 != 0, ds.flags & 2 != 0);
         if ds.tex != 0 && self.tex(ds.tex).is_some() {
             if let Some((v, f)) = self.target_view(ds.tex, 0, ds.mip, ds.slice) {
-                if !ro_d && !ro_s { self.mark_depth_dirty(ds.tex); }
+                self.mark_ds_dirty(ds.tex, !ro_d, !ro_s);
                 let t = self.tex(ds.tex).unwrap();
                 ds_format = Some(f);
                 samples = t.desc.samples;
@@ -2191,8 +2255,8 @@ impl Gpu {
         } else {
             (self.tex(res)?.tex.clone(), tformat)
         };
-        let key = format!("{:?}{}", b.dim, if proxied { ":p" } else { "" });
-        if let Some(v) = self.view_obj(srv_id).and_then(|v| v.views.get(&key)) { return Some(v.clone()); }
+        let key = srv_view_key(b.dim, proxied);
+        if let Some(v) = self.view_obj(srv_id).and_then(|v| v.views.get(key)) { return Some(v.clone()); }
         let total = desc.mips;
         let mip_count = if bb == 0xffff_ffff || bb == 0 { total.saturating_sub(a) } else { bb };
         let layers = desc.d;
@@ -2223,7 +2287,7 @@ impl Gpu {
         }
         let v = self.scoped("SRV view", |_| tex.create_view(&vd))?;
         if !proxied {
-            if let Some(vo) = self.view_obj_mut(srv_id) { vo.views.insert(key, v.clone()); }
+            if let Some(vo) = self.view_obj_mut(srv_id) { vo.views.insert(key.to_string(), v.clone()); }
         }
         Some(v)
     }
@@ -2294,6 +2358,25 @@ impl Gpu {
         Some((ci, off))
     }
 
+    fn white_texture(&mut self) -> TextureView {
+        if let Some(v) = &self.white_view { return v.clone(); }
+        let tex = self.device.create_texture(&TextureDescriptor {
+            label: Some("white"), size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
+            dimension: TextureDimension::D2, format: TextureFormat::Rgba8Unorm, usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST, view_formats: &[],
+        });
+        self.queue.write_texture(TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All }, &[255, 255, 255, 255], TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: None }, Extent3d { width: 1, height: 1, depth_or_array_layers: 1 });
+        let v = tex.create_view(&TextureViewDescriptor::default());
+        self.white_view = Some(v.clone());
+        v
+    }
+    fn ramp_view(&mut self) -> Option<TextureView> {
+        if let Some((id, v)) = &self.ramp_view { if *id == self.ramp_tex { return Some(v.clone()); } }
+        let t = self.tex(self.ramp_tex)?;
+        if t.desc.w != 128 || t.desc.h != 1 { return None; }
+        let v = t.tex.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2), ..Default::default() });
+        self.ramp_view = Some((self.ramp_tex, v.clone()));
+        Some(v)
+    }
     fn dummy_texture(&mut self, b: &Binding) -> TextureView {
         let key = format!("{:?}|{:?}|{}", b.dim, b.sample, b.ms);
         if let Some(v) = self.dummy_tex.get(&key) { return v.clone(); }
@@ -2335,6 +2418,10 @@ impl Gpu {
         let mut key: Vec<u64> = Vec::with_capacity(bindings.len() * 2 + 3);
         key.extend([bgl.1, prog.uid, stage as u64]);
         let mut dyn_off = None;
+        let cloud_fix = stage == 1 && prog.label.starts_with("cascadeshadows_rendering") && (prog.label.contains("CloudShadows") || prog.label.contains("CLOUDS")) && self.ramp_tex != 0 && {
+            let id = *self.s.srv[1].get(6).unwrap_or(&0);
+            self.view_obj(id).filter(|v| !v.is_buf).and_then(|v| self.tex(v.res)).map(|t| (t.desc.w, t.desc.h)) != Some((128, 1))
+        };
         for b in bindings {
             match b.kind {
                 Kind::Uniform => {
@@ -2375,6 +2462,24 @@ impl Gpu {
                     entries.push((b.binding, Res::Smp(s)));
                 }
                 Kind::Texture => {
+                    if cloud_fix && b.binding == 38 {
+                        if let Some(v) = self.ramp_view() {
+                            let r = self.ramp_tex;
+                            self.use_tex(r);
+                            if let Some(t) = self.tex_mut(r) { t.in_bg = true; }
+                            key.push(r as u64 | 1 << 41);
+                            key.push(0);
+                            entries.push((b.binding, Res::View(v)));
+                            continue;
+                        }
+                    }
+                    if cloud_fix && b.binding == 37 {
+                        key.push(1 << 42);
+                        key.push(0);
+                        let d = self.white_texture();
+                        entries.push((b.binding, Res::View(d)));
+                        continue;
+                    }
                     let id = *self.s.srv[stage].get((b.binding as usize).wrapping_sub(32)).unwrap_or(&0);
                     let is_tex = self.view_obj(id).map(|v| !v.is_buf).unwrap_or(false);
                     if is_tex { if let Some(r) = self.view_obj(id).map(|v| v.res) { if self.pending_clears.contains_key(&r) { self.materialize_clears(r); } } }
@@ -2481,26 +2586,38 @@ impl Gpu {
         let pi = self.pass_info.clone()?;
         let (topo, strip) = topology(self.s.topo);
         let strip_fmt = if strip && self.s.ib.0 != 0 { Some(if self.s.ib.1 == 57 { IndexFormat::Uint16 } else { IndexFormat::Uint32 }) } else { None };
-        let mut key: Vec<i64> = vec![vs.uid as i64, ps.map(|p| p.uid as i64).unwrap_or(0), self.s.layout as i64];
-        for p in std::iter::once(vs).chain(ps) {
-            if let Some(m) = self.unfilt.get(&p.uid) { key.extend([-9, m.0 as i64, (m.0 >> 64) as i64]); }
-        }
         let strides: Vec<u32> = (0..16).map(|i| { let v = &self.s.vb[i]; if v.buf != 0 && self.buf(v.buf).map(|b| b.gpu.is_some()).unwrap_or(false) { v.stride } else { 0 } }).collect();
-        for &(slot, _) in &layout.slots { key.push(strides[slot as usize] as i64); }
-        key.extend([self.s.topo as i64, match strip_fmt { Some(IndexFormat::Uint16) => 1, Some(_) => 2, None => 0 }, self.s.blend.0 as i64, self.s.dss.0 as i64, self.s.rs as i64]);
-        for f in &pi.rt_formats { key.push(f.map(|f| format_id(f)).unwrap_or(-1)); }
-        key.extend([-7, pi.ds_format.map(format_id).unwrap_or(-1), pi.samples as i64, pi.ro_depth as i64, pi.ro_stencil as i64]);
+        let st = PipeStates {
+            sig: self.vs_sig()?,
+            rs: if self.s.rs != 0 { self.state(self.s.rs) } else { None },
+            blend: if self.s.blend.0 != 0 { self.state(self.s.blend.0) } else { None },
+            dss: if self.s.dss.0 != 0 { self.state(self.s.dss.0) } else { None },
+        };
+        let strip_code = match strip_fmt { Some(IndexFormat::Uint16) => 1, Some(_) => 2, None => 0 };
+        let key = self.pipe_key(vs, ps, layout, &strides, self.s.topo, strip_code, &st, &pi);
         let _ = (vs_id, ps_id);
         match self.pipelines.get(&key) {
             Some(PipeEntry::Done(p)) => return p.clone(),
-            Some(PipeEntry::Pending) => { self.pending_skips += 1; return None; }
+            Some(PipeEntry::Pending) => {
+                let start = Instant::now();
+                let deadline = start + self.pipe_wait_left;
+                while !matches!(self.pipelines.get(&key), Some(PipeEntry::Done(_))) {
+                    let Ok((done, pipeline)) = self.pipe_results.recv_timeout(deadline.saturating_duration_since(Instant::now())) else { break };
+                    self.finish_pipeline(done, pipeline);
+                }
+                self.pipe_wait_left = self.pipe_wait_left.saturating_sub(start.elapsed());
+                if let Some(PipeEntry::Done(p)) = self.pipelines.get(&key) { return p.clone(); }
+                self.pending_skips += 1;
+                return None;
+            }
             None => {}
         }
         self.pipe_creates += 1;
-        let Some((job, vb_req)) = self.create_pipeline(vs, ps, layout, &strides, topo, strip_fmt, &pi) else {
+        let Some((job, vb_req)) = self.create_pipeline(vs, ps, layout, &strides, topo, strip_fmt, &pi, &st) else {
             self.pipelines.insert(key, PipeEntry::Done(None));
             return None;
         };
+        self.record_recipe(vs, ps, layout, &strides, strip_code, &st, &pi);
         if let Some(tx) = self.pipe_jobs.clone() {
             let id = self.uid();
             self.pipe_pending.insert(id, (key.clone(), vb_req, job.label.clone()));
@@ -2523,8 +2640,8 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_pipeline(&mut self, vs: &Rc<Program>, ps: Option<&Rc<Program>>, layout: &Rc<LayoutObj>, strides: &[u32], topo: PrimitiveTopology, strip_fmt: Option<IndexFormat>, pi: &PassInfo) -> Option<(PipeJob, Vec<VbReq>)> {
-        let vs_obj_sig = self.vs_sig()?;
+    fn create_pipeline(&mut self, vs: &Rc<Program>, ps: Option<&Rc<Program>>, layout: &Rc<LayoutObj>, strides: &[u32], topo: PrimitiveTopology, strip_fmt: Option<IndexFormat>, pi: &PassInfo, st: &PipeStates) -> Option<(PipeJob, Vec<VbReq>)> {
+        let vs_obj_sig = st.sig.clone();
         let label = format!("{} + {}", vs.label, ps.map(|p| p.label.as_str()).unwrap_or("-"));
         let bgl0 = if vs.info.bindings.iter().any(|b| b.group == 0) { self.bgl_for(vs, 0, 0).0 } else { self.empty_bgl() };
         let bgl1 = match ps { Some(p) if p.info.bindings.iter().any(|b| b.group == 1) => self.bgl_for(p, 1, 1).0, _ => self.empty_bgl() };
@@ -2549,9 +2666,7 @@ impl Gpu {
             vb_req.push(VbReq { slot: *slot, instance: *step == VertexStepMode::Instance, stride, last });
         }
 
-        let rs = if self.s.rs != 0 { self.state(self.s.rs) } else { None };
-        let blend = if self.s.blend.0 != 0 { self.state(self.s.blend.0) } else { None };
-        let dss = if self.s.dss.0 != 0 { self.state(self.s.dss.0) } else { None };
+        let (rs, blend, dss) = (st.rs.clone(), st.blend.clone(), st.dss.clone());
         let mut primitive = PrimitiveState { topology: topo, strip_index_format: strip_fmt, ..Default::default() };
         match &rs {
             Some(r) => {
@@ -2608,6 +2723,112 @@ impl Gpu {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn pipe_key(&self, vs: &Program, ps: Option<&Rc<Program>>, layout: &LayoutObj, strides: &[u32], topo: u32, strip_code: i64, st: &PipeStates, pi: &PassInfo) -> Vec<i64> {
+        let mut key: Vec<i64> = vec![vs.stable as i64, ps.map(|p| p.stable as i64).unwrap_or(0), layout.stable as i64];
+        for uid in std::iter::once(vs.uid).chain(ps.map(|p| p.uid)) {
+            if let Some(m) = self.unfilt.get(&uid) { key.extend([-9, m.0 as i64, (m.0 >> 64) as i64]); }
+        }
+        for &(slot, _) in &layout.slots { key.push(strides[slot as usize] as i64); }
+        let sid = |s: &Option<Rc<StateObj>>| s.as_ref().map(|s| s.stable as i64).unwrap_or(0);
+        key.extend([topo as i64, strip_code, sid(&st.blend), sid(&st.dss), sid(&st.rs)]);
+        for f in &pi.rt_formats { key.push(f.map(format_id).unwrap_or(-1)); }
+        key.extend([-7, pi.ds_format.map(format_id).unwrap_or(-1), pi.samples as i64, pi.ro_depth as i64, pi.ro_stencil as i64]);
+        key
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_recipe(&mut self, vs: &Program, ps: Option<&Rc<Program>>, layout: &LayoutObj, strides: &[u32], strip_code: i64, st: &PipeStates, pi: &PassInfo) {
+        if !*PIPE_CACHE || vs.hash.is_empty() || ps.is_some_and(|p| p.hash.is_empty()) || self.recipe_bytes > RECIPE_LIMIT { return; }
+        let mask = |uid: u64| self.unfilt.get(&uid).map(|m| [m.0.to_string(), m.1.to_string()]);
+        let words = |s: &Option<Rc<StateObj>>| s.as_ref().map(|s| s.words.clone());
+        let r = serde_json::json!({
+            "vs": vs.hash, "ps": ps.map(|p| p.hash.clone()),
+            "sig": st.sig.iter().map(|e| [e.sem, e.idx, e.reg]).collect::<Vec<_>>(),
+            "els": layout.els.iter().map(|e| [e.sem, e.idx, e.fmt, e.slot, e.offset, e.cls]).collect::<Vec<_>>(),
+            "slots": layout.slots, "strides": strides, "topo": self.s.topo, "strip": strip_code,
+            "rs": words(&st.rs), "blend": words(&st.blend), "dss": words(&st.dss),
+            "rt": pi.rt_formats.iter().map(|f| f.map(|f| format!("{f:?}"))).collect::<Vec<_>>(),
+            "ds": pi.ds_format.map(|f| format!("{f:?}")), "samples": pi.samples, "rod": pi.ro_depth, "ros": pi.ro_stencil,
+            "uv": mask(vs.uid), "up": ps.and_then(|p| mask(p.uid)),
+        });
+        let line = format!("{r}\n");
+        self.recipe_bytes += line.len() as u64;
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.recipe_path()) { let _ = f.write_all(line.as_bytes()); }
+    }
+
+    fn recipe_path(&self) -> PathBuf {
+        self.shader_dir.parent().unwrap_or(&self.shader_dir).join("pipelines-v1.jsonl")
+    }
+
+    fn load_recipes(&mut self) {
+        if !*PIPE_CACHE { return; }
+        let Ok(text) = std::fs::read_to_string(self.recipe_path()) else { return };
+        self.recipe_bytes = text.len() as u64;
+        self.warm = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        log(&format!("pipeline cache: {} recipes to build during loading", self.warm.len()));
+        self.warm_t0 = Some(Instant::now());
+    }
+
+    fn warm_step(&mut self, budget: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < budget && self.pipe_pending.len() < 8 {
+            let Some(r) = self.warm.pop_front() else { break };
+            if self.warm_one(&r).is_some() { self.warmed += 1; }
+        }
+        if self.warm.is_empty() {
+            if let Some(t0) = self.warm_t0.take() { log(&format!("pipeline cache: built {} pipelines in {:.1} s", self.warmed, t0.elapsed().as_secs_f64())); }
+        }
+    }
+
+    fn warm_one(&mut self, r: &serde_json::Value) -> Option<()> {
+        let u = |v: &serde_json::Value| v.as_u64().map(|x| x as u32);
+        let arr = |v: &serde_json::Value| v.as_array().cloned().unwrap_or_default();
+        let words = |v: &serde_json::Value| v.as_array().map(|a| Rc::new(StateObj { words: a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect::<Vec<_>>(), sampler: None, stable: 0 })).map(|mut s| { Rc::get_mut(&mut s).unwrap().stable = stable_hash(&s.words); s });
+        let vs = self.warm_program(r["vs"].as_str()?, 0)?;
+        let ps = match r["ps"].as_str() { Some(h) => Some(self.warm_program(h, 1)?), None => None };
+        for (p, m) in std::iter::once((&vs, &r["uv"])).chain(ps.iter().map(|p| (p, &r["up"]))) {
+            if let Some(m) = m.as_array() {
+                let a: u128 = m.first()?.as_str()?.parse().ok()?;
+                let b: u128 = m.get(1)?.as_str()?.parse().ok()?;
+                self.unfilt.insert(p.uid, (a, b));
+            }
+        }
+        let els: Vec<El> = arr(&r["els"]).iter().filter_map(|e| { let e = e.as_array()?; let g = |i: usize| e.get(i).and_then(u); Some(El { sem: g(0)?, idx: g(1)?, fmt: g(2)?, slot: g(3)?, offset: g(4)?, cls: g(5)? }) }).collect();
+        let slots: Vec<(u32, u32)> = arr(&r["slots"]).iter().filter_map(|s| { let s = s.as_array()?; Some((u(s.first()?)?, u(s.get(1)?)?)) }).collect();
+        let layout = Rc::new(LayoutObj { stable: layout_stable(&els, &slots), els, slots });
+        let strides: Vec<u32> = arr(&r["strides"]).iter().filter_map(u).collect();
+        if strides.len() != 16 { return None; }
+        let st = PipeStates {
+            sig: arr(&r["sig"]).iter().filter_map(|e| { let e = e.as_array()?; Some(SigEl { sem: u(e.first()?)?, idx: u(e.get(1)?)?, reg: u(e.get(2)?)? }) }).collect(),
+            rs: words(&r["rs"]), blend: words(&r["blend"]), dss: words(&r["dss"]),
+        };
+        let fmt = |v: &serde_json::Value| -> Option<Option<TextureFormat>> { match v.as_str() { None => Some(None), Some(n) => parse_format(n).map(Some) } };
+        let rt_formats = arr(&r["rt"]).iter().map(fmt).collect::<Option<Vec<_>>>()?;
+        let pi = PassInfo { rt_formats, samples: u(&r["samples"])?, ds_format: fmt(&r["ds"])?, ro_depth: r["rod"].as_bool()?, ro_stencil: r["ros"].as_bool()?, width: 1, height: 1 };
+        let topo_raw = u(&r["topo"])?;
+        let (topo, _) = topology(topo_raw);
+        let strip_code = r["strip"].as_i64()?;
+        let strip_fmt = match strip_code { 1 => Some(IndexFormat::Uint16), 2 => Some(IndexFormat::Uint32), _ => None };
+        let key = self.pipe_key(&vs, ps.as_ref(), &layout, &strides, topo_raw, strip_code, &st, &pi);
+        if self.pipelines.contains_key(&key) { return None; }
+        let (job, vb_req) = self.create_pipeline(&vs, ps.as_ref(), &layout, &strides, topo, strip_fmt, &pi, &st)?;
+        let tx = self.pipe_jobs.clone()?;
+        let id = self.uid();
+        self.pipe_pending.insert(id, (key.clone(), vb_req, job.label.clone()));
+        self.pipelines.insert(key, PipeEntry::Pending);
+        let _ = tx.send((id, job));
+        Some(())
+    }
+
+    fn warm_program(&mut self, hash: &str, stage: u32) -> Option<Rc<Program>> {
+        if let Some(p) = self.warm_programs.get(hash) { return p.clone(); }
+        let p = self.load_program(hash, stage);
+        self.warm_programs.insert(hash.to_string(), p.clone());
+        p
+    }
+
     fn finish_pipeline(&mut self, id: u64, pipeline: Option<RenderPipeline>) {
         let Some((key, vb_req, label)) = self.pipe_pending.remove(&id) else { return };
         let entry = pipeline.map(|pipeline| { let uid = self.uid(); Rc::new(Pl { pipeline, uid, vb_req, label }) });
@@ -2636,6 +2857,8 @@ impl Gpu {
         let ps_id = self.s.shader[1];
         let Some(vs) = self.shader_program(vs_id) else { self.skip(); return };
         let ps = if ps_id != 0 { match self.shader_program(ps_id) { Some(p) => Some(p), None => { self.skip(); return } } } else { None };
+        if let Some(p) = &ps { if p.label.ends_with("::PS_SmoothStep") && self.s.rt[0].tex != 0 { self.ramp_tex = self.s.rt[0].tex; } }
+        if !*CLOUD_SHADOWS && ps.as_ref().is_some_and(|p| p.label.starts_with("cascadeshadows_rendering") && p.label.contains("CloudShadows")) { self.skip(); return; }
         // Pause-map fog tiles use world coordinates and the original depth
         // program. Keep their programs separate from the normalized HUD mask.
         let pause = vs.label == "im::VS_Blit"
@@ -2846,7 +3069,7 @@ impl Gpu {
                         for b in &info.bindings { gb.entry(b.group).or_default().push(b.clone()); }
                         for v in gb.values_mut() { v.sort_by_key(|b| b.binding); }
                         let uid = self.uid();
-                        Rc::new(Program { module, info, consts: prog.consts.clone(), pack: prog.pack.as_ref().map(|p| Pack { members: p.members.iter().map(|m| PackMember { binding: m.binding, size: m.size, offset: m.offset }).collect(), size: p.size }), text, flat: vec![], group_bindings: gb, variants: RefCell::new(HashMap::new()), label: prog.label.clone(), uid, vid: false, iid: false, out_locs: vec![], in_locs: vec![], clip: false })
+                        Rc::new(Program { module, info, consts: prog.consts.clone(), pack: prog.pack.as_ref().map(|p| Pack { members: p.members.iter().map(|m| PackMember { binding: m.binding, size: m.size, offset: m.offset }).collect(), size: p.size }), text, flat: vec![], group_bindings: gb, variants: RefCell::new(HashMap::new()), label: prog.label.clone(), uid, stable: uid | 1 << 63, hash: String::new(), vid: false, iid: false, out_locs: vec![], in_locs: vec![], clip: false })
                     }
                     None => { self.compute.insert(key.clone(), None); self.skipped += 1; return; }
                 }
