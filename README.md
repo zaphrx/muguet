@@ -67,6 +67,7 @@ One player hosts from the launcher (or runs `muguet-server` on any machine), the
 - [Dbhardwaj99](https://github.com/Dbhardwaj99) for reporting real free disk space
 - [dre4moff](https://github.com/dre4moff) for releasing controller input when the app loses focus
 - [kjnefk](https://github.com/kjnefk) for importing your own saves
+- [GuruSteve](https://github.com/GuruSteve) for audio on bluetooth headphones
 - [diamondraras](https://github.com/diamondraras) for controller look sensitivity
 - [lunar-me](https://github.com/lunar-me) for fixing a typo in the readme
 
